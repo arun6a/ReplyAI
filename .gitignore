@@ -20,3 +20,5 @@ captures/
 
 # Logs
 *.log
+*.gradle/
+local.properties
