@@ -1,0 +1,22 @@
+# Built files
+*.iml
+.gradle/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# APKs
+*.apk
+*.aab
+*.ap_
+
+# Keystore (when signing is added)
+*.jks
+*.keystore
+
+# Logs
+*.log
