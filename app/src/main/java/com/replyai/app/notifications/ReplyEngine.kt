@@ -427,7 +427,7 @@ object ReplyEngine {
             ""
         }
 
-        val systemPrompt = buildSystemPrompt(bot, history, retrievedContext)
+        val systemPrompt = buildSystemPrompt(bot, history, retrievedContext, retrievalMode)
         val llm = LLMClient(context)
 
         // Serialize LLM calls via a global Mutex. This prevents 10-20 concurrent
@@ -686,6 +686,7 @@ object ReplyEngine {
         bot: Bot,
         history: String,
         retrievedContext: String,
+        retrievalMode: IntentClassifier.RetrievalMode,
     ): String {
         val sb = StringBuilder()
         sb.append(bot.systemPrompt.trim())
@@ -702,7 +703,33 @@ object ReplyEngine {
             sb.append("\nPrevious conversation:\n").append(history).append('\n')
         }
         if (retrievedContext.isNotBlank()) {
-            sb.append("\nRelevant knowledge:\n").append(retrievedContext).append('\n')
+            sb.append("\n=== Relevant knowledge (USE THIS — do not invent beyond it) ===\n")
+            sb.append(retrievedContext).append('\n')
+            sb.append("=== End knowledge ===\n")
+        } else {
+            // CRITICAL anti-hallucination: when no knowledge was retrieved,
+            // tell the LLM explicitly. Otherwise it invents product details.
+            when (retrievalMode) {
+                IntentClassifier.RetrievalMode.FTS5,
+                IntentClassifier.RetrievalMode.VECTOR -> {
+                    sb.append(
+                        "\n⚠️ No knowledge was retrieved for this query. " +
+                            "You have NO information about products, prices, specs, or policies. " +
+                            "Do NOT invent any details. Tell the customer you'll share specifics " +
+                            "shortly and ask them to contact the business directly.\n",
+                    )
+                }
+                IntentClassifier.RetrievalMode.WEB_SEARCH -> {
+                    sb.append(
+                        "\n⚠️ Web search returned no usable results. " +
+                            "Do NOT invent product/price details. Ask the customer to " +
+                            "contact the business directly for specific information.\n",
+                    )
+                }
+                IntentClassifier.RetrievalMode.DIRECT -> {
+                    // No retrieval needed for direct replies — no warning
+                }
+            }
         }
         return sb.toString()
     }
