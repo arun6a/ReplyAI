@@ -1,17 +1,19 @@
 package com.replyai.app.notifications
 
+import android.content.Context
+import android.content.SharedPreferences
 import android.telephony.SmsManager
 import android.util.Log
 import com.replyai.app.bots.Bot
+import com.replyai.app.bots.BotManager
 import com.replyai.app.data.ReplyAIDatabase
+import com.replyai.app.embeddings.EmbeddingProviderFactory
+import com.replyai.app.embeddings.VectorStore
 import com.replyai.app.engine.ConversationMemory
 import com.replyai.app.engine.IntentClassifier
-import com.replyai.app.engine.RetrievalMode
-import com.replyai.app.knowledge.KnowledgeManager
+import com.replyai.app.engine.WebSearchGrounding
 import com.replyai.app.llm.LLMClient
-import com.replyai.app.safety.SafetyConfig
 import com.replyai.app.safety.SafetyRules
-import com.replyai.app.safety.SafetyVerdict
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -25,75 +27,51 @@ import kotlinx.coroutines.launch
  *   1. Finds enabled bots targeting the app.
  *   2. Enforces a per-contact cooldown (5 min); queues messages that arrive
  *      during cooldown.
- *   3. Persists the incoming message to [ConversationMemory] + [ReplyAIDatabase].
- *   4. Runs [SafetyRules] (quiet hours, rate limit, escalation keywords).
+ *   3. Persists the incoming message to [ConversationMemory] (which writes
+ *      both the in-memory cache AND the `messages` table in [ReplyAIDatabase]).
+ *   4. Runs [SafetyRules] (quiet hours, rate limit, escalation keywords, spam).
  *   5. Asks [IntentClassifier] which retrieval mode to use.
- *   6. Calls [LLMClient] with system prompt + history + retrieved knowledge.
+ *   6. Builds an LLM prompt (system prompt + history + retrieved knowledge) and
+ *      calls [LLMClient].
  *   7. Sends the LLM's reply via `ReplyAINotificationListener.replyToNotification`.
  *   8. Persists the outgoing message + writes to `action_log`.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * EXTERNAL DEPENDENCIES (built by parallel agents; see ARCHITECTURE.md §7, §8)
- * ─────────────────────────────────────────────────────────────────────────────
- *   com.replyai.app.bots.Bot
- *       data class Bot(
- *           val id: Long,
- *           val name: String,
- *           val targetApps: List<String>,        // ["com.whatsapp","com.telegram"]
- *           val systemPrompt: String,
- *           val personality: String?,
- *           val enabled: Boolean,
- *           val confidenceThreshold: Double,
- *           val quietHoursStart: Int,             // 0..23
- *           val quietHoursEnd: Int,               // 0..23
- *           val dailyMessageCap: Int,
- *           val dailyCostCapCents: Int,
- *           val createdAt: Long,
- *           val updatedAt: Long,
- *       )
+ * The bot/DB/engine classes used here were built by parallel agents and use
+ * these ACTUAL signatures:
  *
- *   com.replyai.app.data.ReplyAIDatabase   (object)
- *       fun getEnabledBots(): List<Bot>
- *       fun saveIncomingMessage(botId, convKey, sender, text, timestamp)
- *       fun saveOutgoingMessage(botId, convKey, text, retrievalMode, timestamp)
- *       fun logAction(botId, actionType, app, contact, summary)
+ *   com.replyai.app.bots.BotManager   (object)
+ *       fun listBots(context: Context): List<Bot>
+ *
+ *   com.replyai.app.data.ReplyAIDatabase   (singleton via getInstance())
+ *       fun logAction(botId, actionType, app, contact, summary, details): Long
  *
  *   com.replyai.app.engine.ConversationMemory   (object)
- *       fun addIncoming(convKey: String, text: String)
- *       fun addOutgoing(convKey: String, text: String)
- *       fun getHistoryForPrompt(convKey: String): String
+ *       fun addIncoming(context, botId, contactKey, contactName, text)
+ *       fun addOutgoing(context, botId, contactKey, text)
+ *       fun getHistoryForPrompt(context, botId, contactKey, maxExchanges = 10): String
  *
  *   com.replyai.app.engine.IntentClassifier   (object)
- *       suspend fun classify(message: String, bot: Bot): RetrievalMode
+ *       suspend fun classify(message: String, bot: Bot, context: Context?): RetrievalMode
+ *       enum class RetrievalMode { DIRECT, FTS5, VECTOR, WEB_SEARCH }  (nested)
  *
- *   com.replyai.app.engine.RetrievalMode   (enum class)
- *       DIRECT, FTS5, VECTOR, WEB_SEARCH
+ *   com.replyai.app.engine.WebSearchGrounding   (object)
+ *       suspend fun searchSite(siteUrl: String, query: String): String?
+ *       suspend fun fetchPageText(url: String): String?
  *
- *   com.replyai.app.knowledge.KnowledgeManager   (object)
- *       suspend fun searchFts(botId: Long, query: String): String
- *       suspend fun searchVector(botId: Long, query: String): String
- *       suspend fun searchWeb(bot: Bot, query: String): String
+ *   com.replyai.app.embeddings.EmbeddingProviderFactory   (object)
+ *       fun create(): EmbeddingProvider    // has suspend embed(text): FloatArray
  *
- *   com.replyai.app.llm.LLMClient   (object)
- *       suspend fun chat(
- *           systemPrompt: String,
- *           history: String,
- *           userMessage: String,
- *           retrievalContext: String,
- *           mode: RetrievalMode,
- *       ): String
+ *   com.replyai.app.embeddings.VectorStore   (object)
+ *       fun searchSimilar(queryEmbedding: FloatArray, botId: Long, limit: Int = 5): List<SearchResult>
+ *
+ *   com.replyai.app.llm.LLMClient   (class — constructed with context)
+ *       suspend fun chat(userMessage, systemPrompt, tools, toolFilter): LLMResponse
  *
  *   com.replyai.app.safety.SafetyRules   (object)
- *       suspend fun check(bot: Bot, convKey: String, message: String): SafetyVerdict
- *
- *   com.replyai.app.safety.SafetyVerdict   (sealed class)
- *       object Allow : SafetyVerdict
- *       data class Block(val reason: String) : SafetyVerdict
- *       data class Escalate(val reason: String) : SafetyVerdict
- *
- *   com.replyai.app.safety.SafetyConfig   (object)
- *       val ownerPhone: String?      // destination for escalation SMS
- * ─────────────────────────────────────────────────────────────────────────────
+ *       fun isQuietHours(bot, now = LocalDateTime.now()): Boolean
+ *       fun isRateLimited(bot, contactKey, repliesToday): Boolean
+ *       fun shouldEscalate(message): Boolean
+ *       fun isSpam(message): Boolean
  */
 object ReplyEngine {
 
@@ -101,6 +79,10 @@ object ReplyEngine {
 
     /** Cooldown window: don't reply to the same contact twice within 5 minutes. */
     private const val COOLDOWN_MS = 5 * 60 * 1000L
+
+    /** SharedPreferences file + key for the optional owner-phone escalation target. */
+    private const val PREFS_NAME = "replyai_settings"
+    private const val KEY_OWNER_PHONE = "owner_phone"
 
     /**
      * Per-contact cooldown tracking.
@@ -137,6 +119,21 @@ object ReplyEngine {
 
     /** Scope for replaying pending replies asynchronously. */
     private val replayScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /** Application context — set once via [init], then used by every helper. */
+    @Volatile
+    private var appContext: Context? = null
+
+    /**
+     * One-time initialization. Call from [com.replyai.app.ReplyAIApp.onCreate]
+     * (or any other entry point) before the notification listener fires.
+     */
+    fun init(context: Context) {
+        if (appContext == null) appContext = context.applicationContext
+    }
+
+    private fun ctx(): Context =
+        appContext ?: error("ReplyEngine.init(context) must be called first")
 
     /**
      * Main entry point. Called by the NotificationListener in a coroutine.
@@ -187,51 +184,66 @@ object ReplyEngine {
         convKey: String,
     ) {
         val now = System.currentTimeMillis()
+        val context = ctx()
 
-        // Step 3: Save incoming message to ConversationMemory + database.
+        // Step 3: Save incoming message to ConversationMemory (which writes both
+        // the in-memory cache and the `messages` table in ReplyAIDatabase).
         try {
-            ConversationMemory.addIncoming(convKey, "$sender: $message")
-            ReplyAIDatabase.saveIncomingMessage(bot.id, convKey, sender, message, now)
+            ConversationMemory.addIncoming(context, bot.id, convKey, sender, message)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to persist incoming message for $convKey", e)
         }
 
-        // Step 4: Safety rules (quiet hours, rate limit, escalation keywords).
-        val verdict = try {
-            SafetyRules.check(bot, convKey, message)
-        } catch (e: Exception) {
-            Log.w(TAG, "SafetyRules.check failed — defaulting to Allow", e)
-            SafetyVerdict.Allow
-        }
-        when (verdict) {
-            is SafetyVerdict.Block -> {
-                Log.i(TAG, "Blocked by safety rules: ${verdict.reason}")
-                logAction(bot.id, "blocked", packageName, sender,
-                    "Blocked: ${verdict.reason}")
+        // Step 4: Safety rules (quiet hours, rate limit, escalation, spam).
+        //   - isQuietHours  → skip + log
+        //   - isRateLimited  → skip + log
+        //   - shouldEscalate → escalate to owner + skip
+        //   - isSpam         → skip silently
+        try {
+            if (SafetyRules.isSpam(message)) {
+                Log.i(TAG, "Blocked by safety rules: spam detected")
+                logAction(bot.id, "blocked", packageName, sender, "Blocked: spam")
                 return
             }
-            is SafetyVerdict.Escalate -> {
-                Log.w(TAG, "Escalated by safety rules: ${verdict.reason}")
-                escalateToOwner(bot, packageName, sender, message, verdict.reason)
+            if (SafetyRules.shouldEscalate(message)) {
+                val reason = "Escalation keywords detected"
+                Log.w(TAG, "Escalated by safety rules: $reason")
+                escalateToOwner(bot, packageName, sender, message, reason)
                 logAction(bot.id, "escalated", packageName, sender,
-                    "Escalated: ${verdict.reason} | msg: ${preview(message)}")
+                    "Escalated: $reason | msg: ${preview(message)}")
                 return
             }
-            is SafetyVerdict.Allow -> { /* proceed to LLM */ }
+            if (SafetyRules.isQuietHours(bot)) {
+                val reason = "Quiet hours"
+                Log.i(TAG, "Blocked by safety rules: $reason")
+                logAction(bot.id, "blocked", packageName, sender, "Blocked: $reason")
+                return
+            }
+            // Rate-limit check — count today's outgoing replies for this contact.
+            val repliesToday = countRepliesToday(bot.id, convKey)
+            if (SafetyRules.isRateLimited(bot, convKey, repliesToday)) {
+                val reason = "Daily reply cap reached ($repliesToday/${bot.dailyMessageCap})"
+                Log.i(TAG, "Blocked by safety rules: $reason")
+                logAction(bot.id, "blocked", packageName, sender, "Blocked: $reason")
+                return
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "SafetyRules check failed — defaulting to Allow", e)
+            // Fall through to LLM call.
         }
 
         // Step 5: Intent classification → retrieval mode.
         val retrievalMode = try {
-            IntentClassifier.classify(message, bot)
+            IntentClassifier.classify(message, bot, context)
         } catch (e: Exception) {
             Log.w(TAG, "IntentClassifier failed — defaulting to DIRECT", e)
-            RetrievalMode.DIRECT
+            IntentClassifier.RetrievalMode.DIRECT
         }
         Log.i(TAG, "Retrieval mode for $convKey: $retrievalMode")
 
         // Step 6: Build LLM context + call LLMClient.
         val history = try {
-            ConversationMemory.getHistoryForPrompt(convKey)
+            ConversationMemory.getHistoryForPrompt(context, bot.id, convKey)
         } catch (e: Exception) {
             Log.w(TAG, "getHistoryForPrompt failed", e)
             ""
@@ -244,20 +256,19 @@ object ReplyEngine {
             ""
         }
 
-        val replyText = try {
-            LLMClient.chat(
-                systemPrompt = bot.systemPrompt,
-                history = history,
+        val systemPrompt = buildSystemPrompt(bot, history, retrievedContext)
+        val llm = LLMClient(context)
+        val response = try {
+            llm.chat(
                 userMessage = "$sender: $message",
-                retrievalContext = retrievedContext,
-                mode = retrievalMode,
+                systemPrompt = systemPrompt,
             )
         } catch (e: Exception) {
             Log.e(TAG, "LLMClient.chat failed for $convKey", e)
-            logAction(bot.id, "error", packageName, sender,
-                "LLM failed: ${e.message}")
+            logAction(bot.id, "error", packageName, sender, "LLM failed: ${e.message}")
             return
         }
+        val replyText = response.reply
 
         if (replyText.isBlank()) {
             Log.w(TAG, "LLM returned empty reply — not sending")
@@ -289,11 +300,9 @@ object ReplyEngine {
         val sentAt = System.currentTimeMillis()
         try {
             if (sent) {
-                ConversationMemory.addOutgoing(convKey, replyText)
-                ReplyAIDatabase.saveOutgoingMessage(
-                    bot.id, convKey, replyText, retrievalMode.name, sentAt)
+                ConversationMemory.addOutgoing(context, bot.id, convKey, replyText)
                 logAction(bot.id, "reply_sent", packageName, sender,
-                    "Reply: ${preview(replyText)}")
+                    "Reply (${retrievalMode.name}): ${preview(replyText)}")
                 Log.i(TAG, "Reply sent to $convKey: '${preview(replyText)}'")
             } else {
                 // Roll back the cooldown so the next incoming message gets a
@@ -403,7 +412,7 @@ object ReplyEngine {
      */
     private fun findBotsForPackage(packageName: String): List<Bot> {
         return try {
-            ReplyAIDatabase.getEnabledBots().filter { packageName in it.targetApps }
+            BotManager.listBots(ctx()).filter { it.enabled && packageName in it.targetApps }
         } catch (e: Exception) {
             Log.w(TAG, "findBotsForPackage failed for $packageName", e)
             emptyList()
@@ -417,7 +426,10 @@ object ReplyEngine {
      */
     fun hasBotForPackage(packageName: String): Boolean {
         return try {
-            ReplyAIDatabase.getEnabledBots().any { packageName in it.targetApps }
+            if (appContext == null) return false
+            BotManager.listBots(appContext!!).any {
+                it.enabled && packageName in it.targetApps
+            }
         } catch (e: Exception) {
             // On DB failure, return false so we don't spin up coroutines that
             // would just error out. The next notification will retry.
@@ -427,26 +439,104 @@ object ReplyEngine {
 
     /**
      * Retrieve knowledge for the LLM, based on the intent-classified mode.
-     * Delegates to [KnowledgeManager] (built by the knowledge agent).
-     * DIRECT mode skips retrieval entirely.
+     *
+     *   DIRECT      → no retrieval.
+     *   FTS5         → keyword search via [ReplyAIDatabase.searchChunksFts].
+     *   VECTOR       → semantic search via [EmbeddingProviderFactory] + [VectorStore].
+     *   WEB_SEARCH   → site-scoped Google SERP via [WebSearchGrounding].
      */
     private suspend fun retrieveKnowledge(
-        mode: RetrievalMode,
+        mode: IntentClassifier.RetrievalMode,
         bot: Bot,
         query: String,
     ): String {
         return when (mode) {
-            RetrievalMode.DIRECT -> ""
-            RetrievalMode.FTS5 -> KnowledgeManager.searchFts(bot.id, query)
-            RetrievalMode.VECTOR -> KnowledgeManager.searchVector(bot.id, query)
-            RetrievalMode.WEB_SEARCH -> KnowledgeManager.searchWeb(bot, query)
+            IntentClassifier.RetrievalMode.DIRECT -> ""
+            IntentClassifier.RetrievalMode.FTS5 -> {
+                val db = ReplyAIDatabase.getInstance()
+                db.searchChunksFts(query, limit = 5)
+                    .joinToString("\n\n") { (chunk, fileName) ->
+                        "[$fileName] ${chunk.text}"
+                    }
+                    .ifEmpty { "" }
+            }
+            IntentClassifier.RetrievalMode.VECTOR -> {
+                val provider = EmbeddingProviderFactory.create()
+                val queryEmb = provider.embed(query)
+                val results = VectorStore.searchSimilar(queryEmb, bot.id, limit = 5)
+                results.joinToString("\n\n") { "[${it.fileName}] ${it.text}" }
+                    .ifEmpty { "" }
+            }
+            IntentClassifier.RetrievalMode.WEB_SEARCH -> {
+                val site = bot.companyUrl ?: return ""
+                WebSearchGrounding.searchSite(site, query) ?: ""
+            }
         }
     }
 
     /**
+     * Build the system prompt for the LLM by combining the bot's base prompt +
+     * personality + history + retrieved knowledge.
+     */
+    private fun buildSystemPrompt(
+        bot: Bot,
+        history: String,
+        retrievedContext: String,
+    ): String {
+        val sb = StringBuilder()
+        sb.append(bot.systemPrompt.trim())
+        sb.append("\n\n")
+        if (!bot.personality.isNullOrBlank()) {
+            sb.append("Personality: ").append(bot.personality.trim()).append("\n\n")
+        }
+        sb.append(
+            "You are an auto-reply bot running on the user's Android phone. " +
+                "Reply concisely (1-3 sentences). Never invent contact names, " +
+                "phone numbers, or URLs. If you don't know, say so.\n",
+        )
+        if (history.isNotBlank() && history != "(no previous conversation)") {
+            sb.append("\nPrevious conversation:\n").append(history).append('\n')
+        }
+        if (retrievedContext.isNotBlank()) {
+            sb.append("\nRelevant knowledge:\n").append(retrievedContext).append('\n')
+        }
+        return sb.toString()
+    }
+
+    /**
+     * Count today's outgoing replies for (botId, contactKey) — used for the
+     * per-contact daily rate-limit check. Reads directly from the messages
+     * table in [ReplyAIDatabase] via the conversations lookup.
+     *
+     * Defensive: returns 0 on any failure so the rate limiter doesn't block
+     * forever on a DB error.
+     */
+    private fun countRepliesToday(botId: Long, contactKey: String): Int {
+        return try {
+            val db = ReplyAIDatabase.getInstance()
+            val conv = db.getConversation(botId, contactKey)
+            val msgs = db.getConversationMessages(conv.id, limit = 100)
+            val startOfDay = startOfTodayMillis()
+            msgs.count { it.direction == "outgoing" && it.timestamp >= startOfDay }
+        } catch (e: Exception) {
+            Log.w(TAG, "countRepliesToday failed — assuming 0", e)
+            0
+        }
+    }
+
+    private fun startOfTodayMillis(): Long {
+        val cal = java.util.Calendar.getInstance()
+        cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        cal.set(java.util.Calendar.MINUTE, 0)
+        cal.set(java.util.Calendar.SECOND, 0)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        return cal.timeInMillis
+    }
+
+    /**
      * Escalate to the bot owner by sending an SMS with the offending message.
-     * Uses [SafetyConfig.ownerPhone] as the destination. If no owner phone is
-     * configured, the escalation is logged but no SMS is sent.
+     * Uses the `owner_phone` SharedPreferences key as the destination. If no
+     * owner phone is configured, the escalation is logged but no SMS is sent.
      *
      * Requires the `SEND_SMS` permission (already in the manifest).
      */
@@ -458,9 +548,9 @@ object ReplyEngine {
         reason: String,
     ) {
         val ownerPhone = try {
-            SafetyConfig.ownerPhone
+            prefs().getString(KEY_OWNER_PHONE, null)
         } catch (e: Exception) {
-            Log.w(TAG, "SafetyConfig.ownerPhone unavailable", e)
+            Log.w(TAG, "owner_phone unavailable", e)
             null
         }
         if (ownerPhone.isNullOrBlank()) {
@@ -480,6 +570,9 @@ object ReplyEngine {
         }
     }
 
+    private fun prefs(): SharedPreferences =
+        ctx().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
     /** Safe wrapper around `ReplyAIDatabase.logAction` (never throws). */
     private fun logAction(
         botId: Long,
@@ -489,7 +582,8 @@ object ReplyEngine {
         summary: String,
     ) {
         try {
-            ReplyAIDatabase.logAction(botId, actionType, packageName, contact, summary)
+            ReplyAIDatabase.getInstance()
+                .logAction(botId, actionType, packageName, contact, summary, null)
         } catch (e: Exception) {
             Log.w(TAG, "logAction failed (type=$actionType pkg=$packageName)", e)
         }

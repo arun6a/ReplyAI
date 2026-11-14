@@ -311,7 +311,7 @@ class LLMClient(private val context: Context) {
             ?.optJSONObject(0)?.optJSONObject("content")?.optJSONArray("parts")
 
         if (parts == null || parts.length() == 0) {
-            val blockReason = json.optJSONObject("promptFeedback")?.optString("blockReason", "")
+            val blockReason = json.optJSONObject("promptFeedback")?.optString("blockReason", "") ?: ""
             val finishReason = json.optJSONArray("candidates")
                 ?.optJSONObject(0)?.optString("finishReason", "") ?: ""
             val msg = when {

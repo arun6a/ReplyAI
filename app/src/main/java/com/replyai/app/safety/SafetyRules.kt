@@ -171,7 +171,7 @@ object SafetyRules {
         // ALL CAPS + (!!) detection.
         val letters = text.filter { it.isLetter() }
         if (letters.isEmpty()) return false
-        val upperRatio = letters.count { it.isUpperCase() }.toFloat() / letters.size.toFloat()
+        val upperRatio = letters.count { it.isUpperCase() }.toFloat() / letters.length.toFloat()
         val hasBang = text.any { it == '!' }
         val hasSpamWord = SPAM_WORDS_REGEX.containsMatchIn(text)
 

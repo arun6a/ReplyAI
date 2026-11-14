@@ -26,7 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
-import androidx.compose.material.icons.filled.GitHub
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.outlined.BatteryFull
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.NotificationsActive
@@ -279,7 +279,7 @@ private fun AboutSection() {
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
         ) {
             Row(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.GitHub, contentDescription = null)
+                Icon(Icons.Filled.Language, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text("View on GitHub", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
             }

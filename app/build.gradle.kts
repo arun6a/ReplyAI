@@ -90,6 +90,9 @@ dependencies {
     // WorkManager for periodic tasks
     implementation("androidx.work:work-runtime-ktx:2.9.1")
 
+    // ONNX Runtime for on-device embeddings (MiniLM)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.0")
+
     // Debug
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

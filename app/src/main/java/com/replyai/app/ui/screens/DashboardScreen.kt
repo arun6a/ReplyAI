@@ -525,20 +525,8 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
 // Helpers
 // ------------------------------------------------------------------
 
-private fun appNameForPackage(pkg: String?): String {
-    if (pkg.isNullOrBlank()) return "Unknown"
-    return when {
-        pkg.contains("whatsapp", ignoreCase = true) -> "WhatsApp"
-        pkg.contains("telegram", ignoreCase = true) -> "Telegram"
-        pkg.contains("slack", ignoreCase = true) -> "Slack"
-        pkg.contains("discord", ignoreCase = true) -> "Discord"
-        pkg.contains("messenger", ignoreCase = true) -> "Messenger"
-        pkg.contains("instagram", ignoreCase = true) -> "Instagram"
-        pkg.contains("androidmessaging", ignoreCase = true) -> "SMS"
-        pkg.contains("sms", ignoreCase = true) -> "SMS"
-        else -> pkg.substringAfterLast('.').take(10)
-    }
-}
+// Note: appNameForPackage + relativeTime are shared from BotsScreen.kt
+// (declared `internal` there so both files in this package can use them).
 
 private fun colorForPackage(pkg: String?): Color {
     if (pkg.isNullOrBlank()) return Color(0xFF6B7280)
@@ -583,14 +571,4 @@ private fun todayYmd(): String =
 private fun formatCost(cents: Int): String {
     val dollars = cents / 100.0
     return "$" + String.format(Locale.US, "%.2f", dollars)
-}
-
-private fun relativeTime(timestamp: Long): String {
-    val delta = System.currentTimeMillis() - timestamp
-    return when {
-        delta < TimeUnit.MINUTES.toMillis(1) -> "just now"
-        delta < TimeUnit.HOURS.toMillis(1) -> "${TimeUnit.MILLISECONDS.toMinutes(delta)}m ago"
-        delta < TimeUnit.DAYS.toMillis(1) -> "${TimeUnit.MILLISECONDS.toHours(delta)}h ago"
-        else -> SimpleDateFormat("MMM d", Locale.US).format(Date(timestamp))
-    }
 }
