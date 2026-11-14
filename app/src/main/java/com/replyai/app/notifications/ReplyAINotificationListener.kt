@@ -214,10 +214,23 @@ class ReplyAINotificationListener : NotificationListenerService() {
     fun replyToNotification(packageName: String, replyText: String, senderName: String? = null): Boolean {
         try {
             val allNotifs = activeNotifications ?: return false
+            LogCapture.d(TAG, "replyToNotification: ${allNotifs.size} total active notifications, looking for $packageName" +
+                (if (!senderName.isNullOrBlank()) " sender='$senderName'" else ""))
+
             var matchingNotifs = allNotifs.filter { it.packageName == packageName }
             if (matchingNotifs.isEmpty()) {
-                LogCapture.w(TAG, "No active notifications from $packageName")
+                LogCapture.w(TAG, "No active notifications from $packageName (total active: ${allNotifs.size}, packages: ${allNotifs.map { it.packageName }.distinct()})")
                 return false
+            }
+
+            // Log ALL notifications from this package with their action details for debugging
+            for (sbn in matchingNotifs) {
+                val n = sbn.notification
+                val title = n?.extras?.getString(Notification.EXTRA_TITLE)?.toString() ?: ""
+                @Suppress("DEPRECATION")
+                val actionCount = n?.actions?.size ?: -1
+                val hasRemoteInputs = n?.actions?.any { !it.remoteInputs.isNullOrEmpty() } == true
+                LogCapture.d(TAG, "  Notif: title='$title' actions=$actionCount hasReplyAction=$hasRemoteInputs")
             }
 
             // If a sender name was provided, narrow to that sender's notification.
@@ -236,53 +249,94 @@ class ReplyAINotificationListener : NotificationListenerService() {
                 } else {
                     // Fallback: reply to the first available notification rather
                     // than silently dropping the reply. (Better than no reply.)
-                    LogCapture.w(TAG, "No notification from '$senderName' in $packageName — replying to first available")
+                    LogCapture.w(TAG, "No notification from '$senderName' in $packageName — trying all ${matchingNotifs.size} notifications from this package")
                 }
             }
 
             // Find the first notification that has a RemoteInput reply action.
+            // Try sender-filtered first, then fall back to ALL notifications from
+            // this package (MIUI sometimes strips reply actions from some
+            // notifications but not others).
+            val triedNotifs = mutableListOf<StatusBarNotification>()
             for (sbn in matchingNotifs) {
-                val notification = sbn.notification ?: continue
-                @Suppress("DEPRECATION")
-                val actions = notification.actions ?: continue
-                if (actions.isEmpty()) continue
-
-                for (action in actions) {
-                    val remoteInputs = action.remoteInputs ?: continue
-                    if (remoteInputs.isEmpty()) continue
-
-                    LogCapture.i(TAG, "Found reply action in $packageName notification")
-
-                    val replyIntent = Intent().apply {
-                        addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-                    }
-                    // Bundle the reply text into every RemoteInput result key.
-                    // (Apps typically expose exactly one, but looping is safest.)
-                    val results = Bundle()
-                    for (remoteInput in remoteInputs) {
-                        results.putCharSequence(remoteInput.resultKey, replyText)
-                    }
-
-                    // Merge the results into the reply intent — this is what
-                    // makes the app receive the typed text.
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        android.app.RemoteInput.addResultsToIntent(remoteInputs, replyIntent, results)
-                    }
-
-                    action.actionIntent?.send(this, 0, replyIntent)
-                    LogCapture.i(TAG, "Replied to $packageName" +
-                        (if (senderName != null) " ($senderName)" else "") +
-                        ": ${take(replyText, 80)}")
+                triedNotifs.add(sbn)
+                if (tryReplyOnNotification(sbn, packageName, replyText, senderName)) {
                     return true
                 }
             }
 
-            LogCapture.w(TAG, "No reply action found in $packageName notifications")
+            // Fallback: if sender-filtered notifications had no reply action,
+            // try ALL notifications from this package (the reply action might
+            // be on a different notification — e.g., a summary notification on MIUI).
+            if (!senderName.isNullOrBlank() && matchingNotifs != allNotifs.filter { it.packageName == packageName }) {
+                val allFromPackage = allNotifs.filter { it.packageName == packageName }
+                for (sbn in allFromPackage) {
+                    if (sbn in triedNotifs) continue
+                    LogCapture.i(TAG, "Fallback: trying other notification from $packageName")
+                    if (tryReplyOnNotification(sbn, packageName, replyText, null)) {
+                        return true
+                    }
+                }
+            }
+
+            LogCapture.w(TAG, "No reply action found in $packageName notifications (checked ${triedNotifs.size} notif(s), none had RemoteInput action)")
             return false
         } catch (e: Exception) {
             LogCapture.e(TAG, "Failed to reply to notification", e)
             return false
         }
+    }
+
+    /**
+     * Try to find a RemoteInput reply action on a single notification + send the reply.
+     * Returns true if the reply was sent.
+     */
+    private fun tryReplyOnNotification(
+        sbn: StatusBarNotification,
+        packageName: String,
+        replyText: String,
+        senderName: String?,
+    ): Boolean {
+        val notification = sbn.notification ?: return false
+        @Suppress("DEPRECATION")
+        val actions = notification.actions ?: run {
+            LogCapture.d(TAG, "  Notification has null actions array")
+            return false
+        }
+        if (actions.isEmpty()) {
+            LogCapture.d(TAG, "  Notification has 0 actions")
+            return false
+        }
+
+        for (action in actions) {
+            val remoteInputs = action.remoteInputs
+            if (remoteInputs.isNullOrEmpty()) {
+                LogCapture.d(TAG, "  Action '${action.title}' has no remoteInputs")
+                continue
+            }
+
+            LogCapture.i(TAG, "Found reply action in $packageName notification (action title: '${action.title}')")
+
+            val replyIntent = Intent().apply {
+                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+            }
+            val results = Bundle()
+            for (remoteInput in remoteInputs) {
+                results.putCharSequence(remoteInput.resultKey, replyText)
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                android.app.RemoteInput.addResultsToIntent(remoteInputs, replyIntent, results)
+            }
+
+            action.actionIntent?.send(this, 0, replyIntent)
+            LogCapture.i(TAG, "Replied to $packageName" +
+                (if (!senderName.isNullOrBlank()) " ($senderName)" else "") +
+                ": ${take(replyText, 80)}")
+            return true
+        }
+        LogCapture.d(TAG, "  Notification has ${actions.size} action(s) but none with remoteInputs")
+        return false
     }
 
     private fun take(s: String, max: Int): String =
