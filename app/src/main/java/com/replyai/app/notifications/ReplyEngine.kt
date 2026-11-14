@@ -81,21 +81,35 @@ object ReplyEngine {
     /**
      * Cooldown window: don't reply to the same contact twice within this period.
      *
-     * Why 5 seconds (not 30s, not 5min):
-     *   - Duplicate notification posts from WhatsApp arrive within 1-3s of
-     *     each other — these are handled by the notification-key dedup
-     *     (seenNotificationHashes), NOT by this cooldown.
-     *   - This cooldown catches only the case where a user accidentally sends
-     *     the SAME message twice (e.g., double-tap send). 5s is enough.
-     *   - 30s was too long — it blocked legitimate follow-up messages
-     *     ("Hi" → 5s later → "Machine price" was queued for 25s).
-     *   - 5min (original) was absurdly long — blocked normal conversation.
+     * Why 5 seconds:
+     *   - The dedup (seenNotificationHashes) handles duplicate NOTIFICATION POSTS
+     *     (WhatsApp fires onNotificationPosted 3-4× per real message, 1-3s apart).
+     *   - The title='You' skip in NotificationListener handles the self-reply loop.
+     *   - This cooldown is ONLY a safety net for true same-message double-sends
+     *     (user double-taps send, or a spammer hits the same message rapidly).
+     *   - 5s is short enough to NOT block legitimate follow-up messages.
      *
-     * Real follow-up messages (different content, 5+ seconds apart) should
-     * NOT be blocked. The dedup handles duplicates; the cooldown is just
-     * a safety net for true same-message double-sends.
+     * The "reply in progress" lock ([repliesInProgress]) handles the case where
+     * a follow-up message arrives WHILE the LLM is preparing a reply for the
+     * same contact. That message gets queued + processed immediately when the
+     * in-flight reply completes — no 5s wait.
      */
-    private const val COOLDOWN_MS = 5_000L  // 5 seconds
+    private const val COOLDOWN_MS = 5_000L  // 5 seconds (anti-spam safety net only)
+
+    /**
+     * Per-contact "reply in progress" tracking.
+     * Key: `"com.whatsapp:Mom"`. Value: present while a reply is being prepared/sent.
+     *
+     * This is the PRIMARY mechanism for handling concurrent messages from the
+     * same sender. When a reply is in progress:
+     *   - New messages from the SAME sender → queued (combined with existing)
+     *   - New messages from DIFFERENT senders → processed independently
+     *
+     * When the in-flight reply completes, [processPendingReplies] is called
+     * immediately — no cooldown wait. The queued message gets processed right
+     * away with full conversation context (the just-sent reply is in history).
+     */
+    private val repliesInProgress = mutableSetOf<String>()
 
     /**
      * Notification-key dedup window.
@@ -214,23 +228,41 @@ object ReplyEngine {
         // v1.0: first matching bot wins. (Multi-bot-per-app is a future enhancement.)
         val bot = bots.first()
 
-        // Step 2: Cooldown check. If within 5s of last reply, queue + return.
-        val cooldownKey = "$packageName:$sender"
-        val lastReply = lastReplyTime[cooldownKey] ?: 0L
-        if (now - lastReply < COOLDOWN_MS) {
-            val remainingSec = (COOLDOWN_MS - (now - lastReply)) / 1000
-            LogCapture.i(TAG, "Cooldown active for $cooldownKey (${remainingSec}s left) — queuing")
+        // Step 2: Concurrency control — check if a reply is already in progress
+        // for this contact. If so, queue this message (it'll be processed
+        // immediately when the in-flight reply completes, with full context).
+        //
+        // This is the PRIMARY concurrency mechanism:
+        //   - Different sender → repliesInProgress doesn't have this key → process independently
+        //   - Same sender, reply in flight → queue (combined with existing pending)
+        //   - Same sender, no reply in flight → proceed
+        //
+        // Also check the anti-spam cooldown (5s) as a safety net for true
+        // same-message double-sends (user double-taps send button).
+        val lockKey = "$packageName:$sender"
+        val shouldQueue: Boolean
+        synchronized(repliesInProgress) {
+            val inProgress = lockKey in repliesInProgress
+            val now2 = System.currentTimeMillis()
+            val lastReply = lastReplyTime[lockKey] ?: 0L
+            val inCooldown = now2 - lastReply < COOLDOWN_MS
+            shouldQueue = inProgress || inCooldown
+            if (inProgress) {
+                LogCapture.i(TAG, "Reply in progress for $lockKey — queuing")
+            } else if (inCooldown) {
+                val remainingSec = (COOLDOWN_MS - (now2 - lastReply)) / 1000
+                LogCapture.i(TAG, "Anti-spam cooldown for $lockKey (${remainingSec}s left) — queuing")
+            }
+        }
+        if (shouldQueue) {
             queuePending(packageName, sender, message, now)
             return
         }
 
-        // CRITICAL: Set the cooldown NOW — BEFORE the LLM call.
-        // This prevents a race condition where two concurrent coroutines for
-        // the same contact (e.g., "Machine price" + "2 new messages" both from
-        // Arun) both pass the cooldown check before either sets it. By setting
-        // the cooldown here, the second coroutine will see it's active and queue.
-        lastReplyTime[cooldownKey] = now
-        LogCapture.d(TAG, "Cooldown set for $cooldownKey (5s)")
+        // Mark this contact as "reply in progress" so concurrent messages queue.
+        // Released in processReply's finally block.
+        synchronized(repliesInProgress) { repliesInProgress.add(lockKey) }
+        LogCapture.d(TAG, "Lock acquired for $lockKey")
 
         // Steps 3-8.
         processReply(packageName, sender, message, bot, convKey)
@@ -249,7 +281,30 @@ object ReplyEngine {
         bot: Bot,
         convKey: String,
     ) {
-        val now = System.currentTimeMillis()
+        val lockKey = "$packageName:$sender"
+        try {
+            processReplyInternal(packageName, sender, message, bot, convKey)
+        } finally {
+            // ALWAYS release the in-progress lock + set anti-spam cooldown,
+            // even if the reply failed (safety rule block, LLM error, etc.).
+            // This prevents a stuck lock that would queue all future messages.
+            synchronized(repliesInProgress) {
+                repliesInProgress.remove(lockKey)
+            }
+            lastReplyTime[lockKey] = System.currentTimeMillis()
+            LogCapture.d(TAG, "Lock released for $lockKey")
+            // Process any messages that were queued while we were busy.
+            processPendingReplies()
+        }
+    }
+
+    private suspend fun processReplyInternal(
+        packageName: String,
+        sender: String,
+        message: String,
+        bot: Bot,
+        convKey: String,
+    ) {
         val context = ctx()
 
         // Step 3: Save incoming message to ConversationMemory (which writes both
@@ -343,11 +398,6 @@ object ReplyEngine {
         }
 
         // Step 7: Send reply via replyToNotification.
-        // Set cooldown BEFORE sending so our own "reply sent" confirmation
-        // notification doesn't trigger another reply (anti-loop).
-        val cooldownKey = "$packageName:$sender"
-        lastReplyTime[cooldownKey] = System.currentTimeMillis()
-
         val listener = ReplyAINotificationListener.instance
         if (listener == null) {
             LogCapture.e(TAG, "NotificationListener instance is null — cannot reply")
@@ -363,7 +413,6 @@ object ReplyEngine {
         }
 
         // Step 8: Save outgoing message + log to action_log.
-        val sentAt = System.currentTimeMillis()
         try {
             if (sent) {
                 ConversationMemory.addOutgoing(context, bot.id, convKey, replyText)
@@ -371,9 +420,6 @@ object ReplyEngine {
                     "Reply (${retrievalMode.name}): ${preview(replyText)}")
                 LogCapture.i(TAG, "Reply sent to $convKey: '${preview(replyText)}'")
             } else {
-                // Roll back the cooldown so the next incoming message gets a
-                // real chance to trigger a reply (Aira v4.0.93 lesson).
-                lastReplyTime[cooldownKey] = 0L
                 logAction(bot.id, "error", packageName, sender,
                     "replyToNotification returned false")
                 LogCapture.w(TAG, "replyToNotification returned false for $convKey")
@@ -381,9 +427,7 @@ object ReplyEngine {
         } catch (e: Exception) {
             LogCapture.w(TAG, "Failed to persist outgoing/log for $convKey", e)
         }
-
-        // Replay any queued messages whose cooldown has now expired.
-        processPendingReplies()
+        // processPendingReplies() is called by the finally block in processReply wrapper.
     }
 
     /**
@@ -401,9 +445,19 @@ object ReplyEngine {
         synchronized(pendingReplies) {
             if (pendingReplies.isEmpty()) return
             val now = System.currentTimeMillis()
-            toProcess = pendingReplies.filter { p ->
-                val key = "${p.packageName}:${p.sender}"
-                now - (lastReplyTime[key] ?: 0L) >= COOLDOWN_MS
+            // A pending reply is ready to process if:
+            //   - No reply is currently in progress for that contact (lock released)
+            //   - The anti-spam cooldown has expired (5s safety net)
+            // The in-progress lock is the primary check — when a reply completes,
+            // the lock is released + processPendingReplies is called, so queued
+            // messages process IMMEDIATELY (no cooldown wait).
+            synchronized(repliesInProgress) {
+                toProcess = pendingReplies.filter { p ->
+                    val key = "${p.packageName}:${p.sender}"
+                    val inProgress = key in repliesInProgress
+                    val inCooldown = now - (lastReplyTime[key] ?: 0L) < COOLDOWN_MS
+                    !inProgress && !inCooldown
+                }
             }
             if (toProcess.isEmpty()) return
             pendingReplies.removeAll(toProcess)
@@ -415,6 +469,10 @@ object ReplyEngine {
                     val bots = findBotsForPackage(pending.packageName)
                     if (bots.isEmpty()) return@launch
                     val convKey = conversationKey(pending.packageName, pending.sender)
+                    // Acquire the lock before processing (handleIncoming normally
+                    // does this, but we're bypassing it for queued messages).
+                    val lockKey = "${pending.packageName}:${pending.sender}"
+                    synchronized(repliesInProgress) { repliesInProgress.add(lockKey) }
                     processReply(
                         pending.packageName,
                         pending.sender,
