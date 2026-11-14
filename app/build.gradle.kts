@@ -93,6 +93,9 @@ dependencies {
     // ONNX Runtime for on-device embeddings (MiniLM)
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.0")
 
+    // PDF text extraction (PDFBox Android port)
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+
     // Debug
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

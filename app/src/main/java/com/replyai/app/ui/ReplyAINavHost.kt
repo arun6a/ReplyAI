@@ -30,6 +30,7 @@ import com.replyai.app.ui.screens.BotBuilderScreen
 import com.replyai.app.ui.screens.BotDetailScreen
 import com.replyai.app.ui.screens.BotsScreen
 import com.replyai.app.ui.screens.DashboardScreen
+import com.replyai.app.ui.screens.KnowledgeDetailScreen
 import com.replyai.app.ui.screens.KnowledgeScreen
 import com.replyai.app.ui.screens.LogsScreen
 import com.replyai.app.ui.screens.SettingsScreen
@@ -57,6 +58,8 @@ object Routes {
     const val BOT_BUILDER = "bot_builder"
     const val BOT_DETAIL = "bot_detail/{botId}"
     fun botDetail(id: Long) = "bot_detail/$id"
+    const val KNOWLEDGE_DETAIL = "knowledge_detail/{fileId}"
+    fun knowledgeDetail(id: Long) = "knowledge_detail/$id"
 }
 
 @Composable
@@ -114,7 +117,13 @@ fun ReplyAINavHost() {
                     },
                 )
             }
-            composable(Screen.Knowledge.route) { KnowledgeScreen() }
+            composable(Screen.Knowledge.route) {
+                KnowledgeScreen(
+                    onOpenFile = { fileId ->
+                        navController.navigate(Routes.knowledgeDetail(fileId))
+                    },
+                )
+            }
             composable(Screen.Settings.route) { SettingsScreen() }
             composable(Screen.Logs.route) { LogsScreen() }
             composable(Routes.BOT_BUILDER) {
@@ -138,6 +147,18 @@ fun ReplyAINavHost() {
                     botId = botId,
                     onBack = { navController.popBackStack() },
                     onDeleted = { navController.popBackStack() },
+                )
+            }
+            composable(
+                route = Routes.KNOWLEDGE_DETAIL,
+                arguments = listOf(
+                    navArgument("fileId") { type = NavType.LongType },
+                ),
+            ) { backStackEntry ->
+                val fileId = backStackEntry.arguments?.getLong("fileId") ?: -1L
+                KnowledgeDetailScreen(
+                    fileId = fileId,
+                    onBack = { navController.popBackStack() },
                 )
             }
         }

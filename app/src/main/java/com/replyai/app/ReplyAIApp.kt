@@ -4,6 +4,7 @@ import android.app.Application
 import android.os.Environment
 import com.replyai.app.data.ReplyAIDatabase
 import com.replyai.app.embeddings.EmbeddingProviderFactory
+import com.replyai.app.knowledge.DocumentParser
 import com.replyai.app.notifications.ReplyEngine
 import com.replyai.app.util.LogCapture
 import java.io.File
@@ -22,6 +23,11 @@ class ReplyAIApp : Application() {
         // Initialize the ReplyEngine (needs context for ConversationMemory
         // persistence + BotManager + LLMClient reads)
         ReplyEngine.init(this)
+
+        // Initialize the DocumentParser's PDFBox resource loader so .pdf
+        // knowledge uploads work. (Other formats don't need init; PDF does
+        // because PDFBox ships native libraries that must be unpacked once.)
+        DocumentParser.init(this)
 
         // Enable file logging to /Aira/replyai.log so the user can collect
         // full-loop logs for debugging (no logcat access needed on MIUI).

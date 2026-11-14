@@ -221,6 +221,34 @@ class ReplyAIDatabase private constructor(context: Context) :
         return out
     }
 
+    /** Update a chunk's text. Used by the Knowledge detail "Edit chunks" UI. */
+    fun updateChunkText(id: Long, text: String) {
+        writableDatabase.update("chunks", ContentValues().apply { put("text", text) }, "id = ?", arrayOf(id.toString()))
+    }
+
+    /** Replace a chunk's embedding + provider tag. Used by "Re-embed". */
+    fun updateChunkEmbedding(id: Long, embedding: ByteArray?, provider: String?) {
+        writableDatabase.update(
+            "chunks",
+            ContentValues().apply {
+                put("embedding", embedding)
+                put("embedding_provider", provider)
+            },
+            "id = ?",
+            arrayOf(id.toString()),
+        )
+    }
+
+    /** Delete a single chunk (FTS trigger keeps chunks_fts in sync). */
+    fun deleteChunk(id: Long) {
+        writableDatabase.delete("chunks", "id = ?", arrayOf(id.toString()))
+    }
+
+    /** Update the parent file's file_name (used when renaming from the detail screen). */
+    fun updateKnowledgeFileName(id: Long, fileName: String) {
+        writableDatabase.update("knowledge_files", ContentValues().apply { put("file_name", fileName) }, "id = ?", arrayOf(id.toString()))
+    }
+
     /**
      * Keyword search over chunk text via FTS5 BM25 ranking. Returns up to
      * [limit] chunks with their parent file's name. Falls back to LIKE when
