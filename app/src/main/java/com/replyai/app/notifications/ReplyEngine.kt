@@ -78,8 +78,24 @@ object ReplyEngine {
 
     private const val TAG = "ReplyEngine"
 
-    /** Cooldown window: don't reply to the same contact twice within 30s. */
-    private const val COOLDOWN_MS = 30_000L  // 30 seconds (was 5min — too long, blocked follow-up messages)
+    /**
+     * Cooldown window: don't reply to the same contact twice within this period.
+     *
+     * Why 5 seconds (not 30s, not 5min):
+     *   - Duplicate notification posts from WhatsApp arrive within 1-3s of
+     *     each other — these are handled by the notification-key dedup
+     *     (seenNotificationHashes), NOT by this cooldown.
+     *   - This cooldown catches only the case where a user accidentally sends
+     *     the SAME message twice (e.g., double-tap send). 5s is enough.
+     *   - 30s was too long — it blocked legitimate follow-up messages
+     *     ("Hi" → 5s later → "Machine price" was queued for 25s).
+     *   - 5min (original) was absurdly long — blocked normal conversation.
+     *
+     * Real follow-up messages (different content, 5+ seconds apart) should
+     * NOT be blocked. The dedup handles duplicates; the cooldown is just
+     * a safety net for true same-message double-sends.
+     */
+    private const val COOLDOWN_MS = 5_000L  // 5 seconds
 
     /**
      * Notification-key dedup window.
@@ -198,7 +214,7 @@ object ReplyEngine {
         // v1.0: first matching bot wins. (Multi-bot-per-app is a future enhancement.)
         val bot = bots.first()
 
-        // Step 2: Cooldown check. If within 30s of last reply, queue + return.
+        // Step 2: Cooldown check. If within 5s of last reply, queue + return.
         val cooldownKey = "$packageName:$sender"
         val lastReply = lastReplyTime[cooldownKey] ?: 0L
         if (now - lastReply < COOLDOWN_MS) {
@@ -214,7 +230,7 @@ object ReplyEngine {
         // Arun) both pass the cooldown check before either sets it. By setting
         // the cooldown here, the second coroutine will see it's active and queue.
         lastReplyTime[cooldownKey] = now
-        LogCapture.d(TAG, "Cooldown set for $cooldownKey (30s)")
+        LogCapture.d(TAG, "Cooldown set for $cooldownKey (5s)")
 
         // Steps 3-8.
         processReply(packageName, sender, message, bot, convKey)
