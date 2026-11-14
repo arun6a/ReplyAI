@@ -199,9 +199,6 @@ object ReplyEngine {
         val bot = bots.first()
 
         // Step 2: Cooldown check. If within 30s of last reply, queue + return.
-        // The cooldown is SET before sending the reply (in processReply step 7),
-        // so concurrent notifications for the SAME message are blocked here
-        // after the first one wins the race.
         val cooldownKey = "$packageName:$sender"
         val lastReply = lastReplyTime[cooldownKey] ?: 0L
         if (now - lastReply < COOLDOWN_MS) {
@@ -210,6 +207,14 @@ object ReplyEngine {
             queuePending(packageName, sender, message, now)
             return
         }
+
+        // CRITICAL: Set the cooldown NOW — BEFORE the LLM call.
+        // This prevents a race condition where two concurrent coroutines for
+        // the same contact (e.g., "Machine price" + "2 new messages" both from
+        // Arun) both pass the cooldown check before either sets it. By setting
+        // the cooldown here, the second coroutine will see it's active and queue.
+        lastReplyTime[cooldownKey] = now
+        LogCapture.d(TAG, "Cooldown set for $cooldownKey (30s)")
 
         // Steps 3-8.
         processReply(packageName, sender, message, bot, convKey)

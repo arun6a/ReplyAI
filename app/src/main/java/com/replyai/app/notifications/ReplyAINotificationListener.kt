@@ -127,6 +127,29 @@ class ReplyAINotificationListener : NotificationListenerService() {
         // Skip those — there's no specific message to reply to.
         if (title.isEmpty() && text.isEmpty()) return
 
+        // CRITICAL: Skip OUTGOING message notifications.
+        // WhatsApp marks messages sent by the user (i.e., our own auto-replies)
+        // with title="You". If we don't skip these, ReplyAI sees its own reply
+        // as an incoming message → replies to it → that reply becomes another
+        // "You" notification → infinite self-reply loop.
+        //
+        // This was the root cause of the "4 replies for 1 message" bug in the
+        // user's testing. The dedup fixed duplicate INCOMING notifications, but
+        // the self-reply loop was a separate issue.
+        if (title.equals("You", ignoreCase = true)) {
+            LogCapture.d(TAG, "Skipping outgoing message notification (title='You')")
+            return
+        }
+
+        // CRITICAL: Skip summary/counter notifications.
+        // WhatsApp posts "N new messages" notifications that have no real
+        // message content — they're just unread counters. Replying to them
+        // sends a reply to the conversation list, not a specific message.
+        if (text.matches(Regex("""\d+\s+new messages?""", RegexOption.IGNORE_CASE))) {
+            LogCapture.d(TAG, "Skipping summary notification: '$text'")
+            return
+        }
+
         LogCapture.d(TAG, "Posted from $packageName: title='$title' text='${take(text, 80)}'")
 
         // Cheap sync check: only launch the coroutine if a bot is configured.
