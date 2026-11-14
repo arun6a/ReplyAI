@@ -150,7 +150,25 @@ class ReplyAINotificationListener : NotificationListenerService() {
             return
         }
 
-        LogCapture.d(TAG, "Posted from $packageName: title='$title' text='${take(text, 80)}'")
+        // CRITICAL: Skip stale notifications (airplane mode recovery).
+        // When the phone reconnects after hours offline, WhatsApp delivers all
+        // queued notifications at once. A message from 5 hours ago like "are
+        // you free tonight?" doesn't need a reply at 3am.
+        //
+        // sbn.postTime is when the notification was originally posted (epoch ms).
+        // We skip if older than MAX_NOTIFICATION_AGE_HOURS (default 2h).
+        val postTime = sbn.postTime
+        val ageMs = System.currentTimeMillis() - postTime
+        val maxAgeMs = 2 * 60 * 60 * 1000L  // 2 hours
+        if (ageMs > maxAgeMs) {
+            val ageHours = ageMs / (60 * 60 * 1000)
+            LogCapture.i(TAG, "Skipping stale notification from $packageName/$title " +
+                "(${ageHours}h old — posted at ${java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(postTime))})")
+            return
+        }
+
+        LogCapture.d(TAG, "Posted from $packageName: title='$title' text='${take(text, 80)}'" +
+            (if (ageMs > 60_000) " (${ageMs / 60_000}min old)" else ""))
 
         // Cheap sync check: only launch the coroutine if a bot is configured.
         // Avoids waking up ReplyEngine for every WhatsApp notification when the

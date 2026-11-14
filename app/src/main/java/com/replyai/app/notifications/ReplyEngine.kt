@@ -18,7 +18,10 @@ import com.replyai.app.safety.SafetyRules
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * ReplyEngine — the orchestrator.
@@ -110,6 +113,39 @@ object ReplyEngine {
      * away with full conversation context (the just-sent reply is in history).
      */
     private val repliesInProgress = mutableSetOf<String>()
+
+    /**
+     * LLM serialization Mutex — ensures only ONE LLM call runs at a time.
+     *
+     * Why: when 10-20 notifications arrive at once (airplane mode recovery,
+     * group chat burst), launching 10-20 concurrent LLM calls:
+     *   1. Hits Gemini/OpenAI free-tier rate limits (15 RPM) → most fail
+     *   2. Wastes paid-tier budget on parallel calls
+     *   3. Sends 10-20 replies in rapid succession → looks spammy → WhatsApp
+     *      might flag the account
+     *
+     * Serializing LLM calls naturally spaces out replies (~1.5s each = 10
+     * replies spread over 15s, not all at once). This is gentler on the LLM
+     * provider + gentler on WhatsApp's anti-spam heuristics.
+     *
+     * The Mutex is global (not per-contact) — even different contacts' replies
+     * are serialized. This is intentional: rate limits are per-account, not
+     * per-conversation.
+     */
+    private val llmMutex = Mutex()
+
+    /**
+     * Burst detection — tracks how many notifications arrived in the last
+     * BURST_WINDOW_MS. If > BURST_THRESHOLD, we're in "burst mode" (airplane
+     * mode recovery, group chat burst, etc.).
+     *
+     * In burst mode, we add a small delay (REPLY_SPACING_MS) between replies
+     * to avoid spamming recipients. Normal mode has no delay.
+     */
+    private const val BURST_WINDOW_MS = 10_000L  // 10 seconds
+    private const val BURST_THRESHOLD = 3         // 3+ notifications in 10s = burst
+    private const val REPLY_SPACING_MS = 2000L   // 2s between replies in burst mode
+    private val recentNotificationTimes = mutableListOf<Long>()
 
     /**
      * Notification-key dedup window.
@@ -214,6 +250,20 @@ object ReplyEngine {
                 return
             }
             seenNotificationHashes[notifHash] = now
+        }
+
+        // Track notification timing for burst detection.
+        // If 3+ notifications arrive within 10s, we're in "burst mode"
+        // (airplane mode recovery, group chat). Burst mode adds a 2s delay
+        // between replies to avoid spamming recipients.
+        val isBurst = synchronized(recentNotificationTimes) {
+            recentNotificationTimes.add(now)
+            val cutoff = now - BURST_WINDOW_MS
+            recentNotificationTimes.removeAll { it < cutoff }
+            recentNotificationTimes.size > BURST_THRESHOLD
+        }
+        if (isBurst) {
+            LogCapture.i(TAG, "Burst mode: ${recentNotificationTimes.size} notifications in ${BURST_WINDOW_MS / 1000}s — spacing replies")
         }
 
         val convKey = conversationKey(packageName, sender)
@@ -379,11 +429,28 @@ object ReplyEngine {
 
         val systemPrompt = buildSystemPrompt(bot, history, retrievedContext)
         val llm = LLMClient(context)
+
+        // Serialize LLM calls via a global Mutex. This prevents 10-20 concurrent
+        // LLM calls when notifications burst in (airplane mode recovery).
+        // Benefits:
+        //   1. Respects LLM provider rate limits (Gemini 15 RPM free tier)
+        //   2. Spaces out replies (1.5s each, not all at once) — gentler on
+        //      WhatsApp's anti-spam heuristics
+        //   3. One failure doesn't cascade (each call is independent)
         val response = try {
-            llm.chat(
-                userMessage = "$sender: $message",
-                systemPrompt = systemPrompt,
-            )
+            llmMutex.withLock {
+                // In burst mode, add a small delay before the LLM call to
+                // space out replies. This is in addition to the Mutex
+                // serialization (which already ensures one-at-a-time).
+                if (isBurstMode()) {
+                    LogCapture.d(TAG, "Burst mode: waiting ${REPLY_SPACING_MS}ms before LLM call for $convKey")
+                    delay(REPLY_SPACING_MS)
+                }
+                llm.chat(
+                    userMessage = "$sender: $message",
+                    systemPrompt = systemPrompt,
+                )
+            }
         } catch (e: Exception) {
             LogCapture.e(TAG, "LLMClient.chat failed for $convKey", e)
             logAction(bot.id, "error", packageName, sender, "LLM failed: ${e.message}")
@@ -529,6 +596,19 @@ object ReplyEngine {
     /** Truncate a string for safe logging (avoids 10KB log lines). */
     private fun preview(s: String, max: Int = 80): String =
         if (s.length <= max) s else s.substring(0, max) + "..."
+
+    /**
+     * Check if we're currently in "burst mode" — 3+ notifications in the last
+     * 10 seconds. Used to decide whether to add a delay between replies.
+     */
+    private fun isBurstMode(): Boolean {
+        val now = System.currentTimeMillis()
+        return synchronized(recentNotificationTimes) {
+            val cutoff = now - BURST_WINDOW_MS
+            recentNotificationTimes.removeAll { it < cutoff }
+            recentNotificationTimes.size > BURST_THRESHOLD
+        }
+    }
 
     /**
      * Find all enabled bots whose `targetApps` contains [packageName].
