@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.telephony.SmsManager
 import android.util.Log
+import com.replyai.app.util.LogCapture
 import com.replyai.app.bots.Bot
 import com.replyai.app.bots.BotManager
 import com.replyai.app.data.ReplyAIDatabase
@@ -77,8 +78,24 @@ object ReplyEngine {
 
     private const val TAG = "ReplyEngine"
 
-    /** Cooldown window: don't reply to the same contact twice within 5 minutes. */
-    private const val COOLDOWN_MS = 5 * 60 * 1000L
+    /** Cooldown window: don't reply to the same contact twice within 30s. */
+    private const val COOLDOWN_MS = 30_000L  // 30 seconds (was 5min — too long, blocked follow-up messages)
+
+    /**
+     * Notification-key dedup window.
+     *
+     * WhatsApp fires `onNotificationPosted` 3-4× per real message (summary,
+     * per-conversation, group refresh, badge update). Each fires a separate
+     * handleIncoming coroutine. Without dedup they all race past the cooldown
+     * check before any of them sets it, producing "4 replies for 1 message".
+     *
+     * Fix: hash(package + sender + message) tracked for DEDUP_WINDOW_MS.
+     * Duplicate hashes are skipped. Complements the per-contact cooldown.
+     */
+    private const val DEDUP_WINDOW_MS = 10_000L  // 10 seconds
+
+    /** Recently-seen notification hashes → timestamp. */
+    private val seenNotificationHashes = mutableMapOf<Int, Long>()
 
     /** SharedPreferences file + key for the optional owner-phone escalation target. */
     private const val PREFS_NAME = "replyai_settings"
@@ -144,24 +161,52 @@ object ReplyEngine {
      */
     suspend fun handleIncoming(packageName: String, sender: String, message: String) {
         val now = System.currentTimeMillis()
+
+        // Step 0 (DEDUP): Block the same notification from being processed twice.
+        // WhatsApp fires onNotificationPosted 3-4× per real message (summary,
+        // per-conversation, group refresh, badge update). Each one launches a
+        // separate coroutine here; without dedup they all pass the cooldown
+        // check before any of them sets it, producing "4 replies for 1 message".
+        //
+        // Key is a hash of (package + sender + message). If we've seen this
+        // exact notification within DEDUP_WINDOW_MS, skip it silently.
+        val notifHash = "$packageName|$sender|$message".hashCode()
+        synchronized(seenNotificationHashes) {
+            val lastSeen = seenNotificationHashes[notifHash]
+            if (lastSeen != null && now - lastSeen < DEDUP_WINDOW_MS) {
+                LogCapture.d(TAG, "Dedup: skipping duplicate notification from " +
+                    "$packageName/$sender (seen ${now - lastSeen}ms ago)")
+                // Periodic cleanup: prune stale entries (older than 2× window)
+                if (seenNotificationHashes.size > 100) {
+                    val cutoff = now - (DEDUP_WINDOW_MS * 2)
+                    seenNotificationHashes.entries.removeAll { it.value < cutoff }
+                }
+                return
+            }
+            seenNotificationHashes[notifHash] = now
+        }
+
         val convKey = conversationKey(packageName, sender)
-        Log.i(TAG, "Incoming from $convKey: '${preview(message)}'")
+        LogCapture.i(TAG, "Incoming from $convKey: '${preview(message)}'")
 
         // Step 1: Find enabled bots whose target_apps contains packageName.
         val bots = findBotsForPackage(packageName)
         if (bots.isEmpty()) {
-            Log.d(TAG, "No enabled bot configured for $packageName — ignoring")
+            LogCapture.d(TAG, "No enabled bot configured for $packageName — ignoring")
             return
         }
         // v1.0: first matching bot wins. (Multi-bot-per-app is a future enhancement.)
         val bot = bots.first()
 
-        // Step 2: Cooldown check. If within 5 min of last reply, queue + return.
+        // Step 2: Cooldown check. If within 30s of last reply, queue + return.
+        // The cooldown is SET before sending the reply (in processReply step 7),
+        // so concurrent notifications for the SAME message are blocked here
+        // after the first one wins the race.
         val cooldownKey = "$packageName:$sender"
         val lastReply = lastReplyTime[cooldownKey] ?: 0L
         if (now - lastReply < COOLDOWN_MS) {
             val remainingSec = (COOLDOWN_MS - (now - lastReply)) / 1000
-            Log.i(TAG, "Cooldown active for $cooldownKey (${remainingSec}s left) — queuing")
+            LogCapture.i(TAG, "Cooldown active for $cooldownKey (${remainingSec}s left) — queuing")
             queuePending(packageName, sender, message, now)
             return
         }
@@ -191,7 +236,7 @@ object ReplyEngine {
         try {
             ConversationMemory.addIncoming(context, bot.id, convKey, sender, message)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to persist incoming message for $convKey", e)
+            LogCapture.w(TAG, "Failed to persist incoming message for $convKey", e)
         }
 
         // Step 4: Safety rules (quiet hours, rate limit, escalation, spam).
@@ -201,13 +246,13 @@ object ReplyEngine {
         //   - isSpam         → skip silently
         try {
             if (SafetyRules.isSpam(message)) {
-                Log.i(TAG, "Blocked by safety rules: spam detected")
+                LogCapture.i(TAG, "Blocked by safety rules: spam detected")
                 logAction(bot.id, "blocked", packageName, sender, "Blocked: spam")
                 return
             }
             if (SafetyRules.shouldEscalate(message)) {
                 val reason = "Escalation keywords detected"
-                Log.w(TAG, "Escalated by safety rules: $reason")
+                LogCapture.w(TAG, "Escalated by safety rules: $reason")
                 escalateToOwner(bot, packageName, sender, message, reason)
                 logAction(bot.id, "escalated", packageName, sender,
                     "Escalated: $reason | msg: ${preview(message)}")
@@ -215,7 +260,7 @@ object ReplyEngine {
             }
             if (SafetyRules.isQuietHours(bot)) {
                 val reason = "Quiet hours"
-                Log.i(TAG, "Blocked by safety rules: $reason")
+                LogCapture.i(TAG, "Blocked by safety rules: $reason")
                 logAction(bot.id, "blocked", packageName, sender, "Blocked: $reason")
                 return
             }
@@ -223,12 +268,12 @@ object ReplyEngine {
             val repliesToday = countRepliesToday(bot.id, convKey)
             if (SafetyRules.isRateLimited(bot, convKey, repliesToday)) {
                 val reason = "Daily reply cap reached ($repliesToday/${bot.dailyMessageCap})"
-                Log.i(TAG, "Blocked by safety rules: $reason")
+                LogCapture.i(TAG, "Blocked by safety rules: $reason")
                 logAction(bot.id, "blocked", packageName, sender, "Blocked: $reason")
                 return
             }
         } catch (e: Exception) {
-            Log.w(TAG, "SafetyRules check failed — defaulting to Allow", e)
+            LogCapture.w(TAG, "SafetyRules check failed — defaulting to Allow", e)
             // Fall through to LLM call.
         }
 
@@ -236,23 +281,23 @@ object ReplyEngine {
         val retrievalMode = try {
             IntentClassifier.classify(message, bot, context)
         } catch (e: Exception) {
-            Log.w(TAG, "IntentClassifier failed — defaulting to DIRECT", e)
+            LogCapture.w(TAG, "IntentClassifier failed — defaulting to DIRECT", e)
             IntentClassifier.RetrievalMode.DIRECT
         }
-        Log.i(TAG, "Retrieval mode for $convKey: $retrievalMode")
+        LogCapture.i(TAG, "Retrieval mode for $convKey: $retrievalMode")
 
         // Step 6: Build LLM context + call LLMClient.
         val history = try {
             ConversationMemory.getHistoryForPrompt(context, bot.id, convKey)
         } catch (e: Exception) {
-            Log.w(TAG, "getHistoryForPrompt failed", e)
+            LogCapture.w(TAG, "getHistoryForPrompt failed", e)
             ""
         }
 
         val retrievedContext = try {
             retrieveKnowledge(retrievalMode, bot, message)
         } catch (e: Exception) {
-            Log.w(TAG, "retrieveKnowledge failed", e)
+            LogCapture.w(TAG, "retrieveKnowledge failed", e)
             ""
         }
 
@@ -264,14 +309,14 @@ object ReplyEngine {
                 systemPrompt = systemPrompt,
             )
         } catch (e: Exception) {
-            Log.e(TAG, "LLMClient.chat failed for $convKey", e)
+            LogCapture.e(TAG, "LLMClient.chat failed for $convKey", e)
             logAction(bot.id, "error", packageName, sender, "LLM failed: ${e.message}")
             return
         }
         val replyText = response.reply
 
         if (replyText.isBlank()) {
-            Log.w(TAG, "LLM returned empty reply — not sending")
+            LogCapture.w(TAG, "LLM returned empty reply — not sending")
             logAction(bot.id, "error", packageName, sender, "Empty LLM reply")
             return
         }
@@ -284,7 +329,7 @@ object ReplyEngine {
 
         val listener = ReplyAINotificationListener.instance
         if (listener == null) {
-            Log.e(TAG, "NotificationListener instance is null — cannot reply")
+            LogCapture.e(TAG, "NotificationListener instance is null — cannot reply")
             logAction(bot.id, "error", packageName, sender, "Listener not connected")
             return
         }
@@ -292,7 +337,7 @@ object ReplyEngine {
         val sent = try {
             listener.replyToNotification(packageName, replyText, sender)
         } catch (e: Exception) {
-            Log.e(TAG, "replyToNotification threw", e)
+            LogCapture.e(TAG, "replyToNotification threw", e)
             false
         }
 
@@ -303,17 +348,17 @@ object ReplyEngine {
                 ConversationMemory.addOutgoing(context, bot.id, convKey, replyText)
                 logAction(bot.id, "reply_sent", packageName, sender,
                     "Reply (${retrievalMode.name}): ${preview(replyText)}")
-                Log.i(TAG, "Reply sent to $convKey: '${preview(replyText)}'")
+                LogCapture.i(TAG, "Reply sent to $convKey: '${preview(replyText)}'")
             } else {
                 // Roll back the cooldown so the next incoming message gets a
                 // real chance to trigger a reply (Aira v4.0.93 lesson).
                 lastReplyTime[cooldownKey] = 0L
                 logAction(bot.id, "error", packageName, sender,
                     "replyToNotification returned false")
-                Log.w(TAG, "replyToNotification returned false for $convKey")
+                LogCapture.w(TAG, "replyToNotification returned false for $convKey")
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to persist outgoing/log for $convKey", e)
+            LogCapture.w(TAG, "Failed to persist outgoing/log for $convKey", e)
         }
 
         // Replay any queued messages whose cooldown has now expired.
@@ -342,7 +387,7 @@ object ReplyEngine {
             if (toProcess.isEmpty()) return
             pendingReplies.removeAll(toProcess)
         }
-        Log.i(TAG, "Processing ${toProcess.size} pending reply(ies) from queue")
+        LogCapture.i(TAG, "Processing ${toProcess.size} pending reply(ies) from queue")
         for (pending in toProcess) {
             replayScope.launch {
                 try {
@@ -357,7 +402,7 @@ object ReplyEngine {
                         convKey,
                     )
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to process pending reply for " +
+                    LogCapture.e(TAG, "Failed to process pending reply for " +
                         "${pending.packageName}:${pending.sender}", e)
                 }
             }
@@ -383,11 +428,11 @@ object ReplyEngine {
                     message = "${existing.message}\n$message",
                     arrivedAt = now,
                 )
-                Log.i(TAG, "Combined pending message for $packageName:$sender " +
+                LogCapture.i(TAG, "Combined pending message for $packageName:$sender " +
                     "(now '${preview(pendingReplies[idx].message)}')")
             } else {
                 pendingReplies.add(PendingReply(packageName, sender, message, now))
-                Log.i(TAG, "Queued new pending message for $packageName:$sender")
+                LogCapture.i(TAG, "Queued new pending message for $packageName:$sender")
             }
         }
     }
@@ -414,7 +459,7 @@ object ReplyEngine {
         return try {
             BotManager.listBots(ctx()).filter { it.enabled && packageName in it.targetApps }
         } catch (e: Exception) {
-            Log.w(TAG, "findBotsForPackage failed for $packageName", e)
+            LogCapture.w(TAG, "findBotsForPackage failed for $packageName", e)
             emptyList()
         }
     }
@@ -519,7 +564,7 @@ object ReplyEngine {
             val startOfDay = startOfTodayMillis()
             msgs.count { it.direction == "outgoing" && it.timestamp >= startOfDay }
         } catch (e: Exception) {
-            Log.w(TAG, "countRepliesToday failed — assuming 0", e)
+            LogCapture.w(TAG, "countRepliesToday failed — assuming 0", e)
             0
         }
     }
@@ -550,11 +595,11 @@ object ReplyEngine {
         val ownerPhone = try {
             prefs().getString(KEY_OWNER_PHONE, null)
         } catch (e: Exception) {
-            Log.w(TAG, "owner_phone unavailable", e)
+            LogCapture.w(TAG, "owner_phone unavailable", e)
             null
         }
         if (ownerPhone.isNullOrBlank()) {
-            Log.w(TAG, "No owner phone configured — escalation SMS skipped " +
+            LogCapture.w(TAG, "No owner phone configured — escalation SMS skipped " +
                 "(reason: $reason)")
             return
         }
@@ -564,9 +609,9 @@ object ReplyEngine {
                 "${preview(message, 60)} (reason: $reason)"
             val mgr = SmsManager.getDefault()
             mgr.sendTextMessage(ownerPhone, null, smsText, null, null)
-            Log.i(TAG, "Escalation SMS sent to $ownerPhone")
+            LogCapture.i(TAG, "Escalation SMS sent to $ownerPhone")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to send escalation SMS to $ownerPhone", e)
+            LogCapture.e(TAG, "Failed to send escalation SMS to $ownerPhone", e)
         }
     }
 
@@ -585,7 +630,7 @@ object ReplyEngine {
             ReplyAIDatabase.getInstance()
                 .logAction(botId, actionType, packageName, contact, summary, null)
         } catch (e: Exception) {
-            Log.w(TAG, "logAction failed (type=$actionType pkg=$packageName)", e)
+            LogCapture.w(TAG, "logAction failed (type=$actionType pkg=$packageName)", e)
         }
     }
 }

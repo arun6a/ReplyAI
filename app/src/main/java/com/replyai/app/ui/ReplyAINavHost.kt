@@ -3,6 +3,7 @@ package com.replyai.app.ui
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.Chat
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.MenuBook
@@ -30,6 +31,7 @@ import com.replyai.app.ui.screens.BotDetailScreen
 import com.replyai.app.ui.screens.BotsScreen
 import com.replyai.app.ui.screens.DashboardScreen
 import com.replyai.app.ui.screens.KnowledgeScreen
+import com.replyai.app.ui.screens.LogsScreen
 import com.replyai.app.ui.screens.SettingsScreen
 
 /**
@@ -44,6 +46,7 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
     data object Bots : Screen("bots", "Bots", Icons.Outlined.SmartToy)
     data object Knowledge : Screen("knowledge", "Knowledge", Icons.Outlined.MenuBook)
     data object Settings : Screen("settings", "Settings", Icons.Outlined.Settings)
+    data object Logs : Screen("logs", "Logs", Icons.Outlined.BugReport)
 }
 
 /**
@@ -59,7 +62,7 @@ object Routes {
 @Composable
 fun ReplyAINavHost() {
     val navController = rememberNavController()
-    val screens = listOf(Screen.Dashboard, Screen.Bots, Screen.Knowledge, Screen.Settings)
+    val screens = listOf(Screen.Dashboard, Screen.Bots, Screen.Knowledge, Screen.Settings, Screen.Logs)
 
     Scaffold(
         bottomBar = {
@@ -113,6 +116,7 @@ fun ReplyAINavHost() {
             }
             composable(Screen.Knowledge.route) { KnowledgeScreen() }
             composable(Screen.Settings.route) { SettingsScreen() }
+            composable(Screen.Logs.route) { LogsScreen() }
             composable(Routes.BOT_BUILDER) {
                 BotBuilderScreen(
                     onBack = { navController.popBackStack() },

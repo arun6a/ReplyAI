@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
+import com.replyai.app.util.LogCapture
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -78,20 +79,20 @@ class ReplyAINotificationListener : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         instance = this
-        Log.i(TAG, "Connected — ready to receive notifications")
+        LogCapture.i(TAG, "Connected — ready to receive notifications")
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
         instance = null
-        Log.w(TAG, "Disconnected — requesting rebind")
+        LogCapture.w(TAG, "Disconnected — requesting rebind")
         // Proactively ask the system to reconnect us. Android sometimes
         // unbinds the listener (app update, OOM, settings change); this is
         // the official keep-alive API since API 24.
         try {
             requestRebind(ComponentName(this, ReplyAINotificationListener::class.java))
         } catch (e: Exception) {
-            Log.e(TAG, "requestRebind failed", e)
+            LogCapture.e(TAG, "requestRebind failed", e)
         }
     }
 
@@ -126,13 +127,13 @@ class ReplyAINotificationListener : NotificationListenerService() {
         // Skip those — there's no specific message to reply to.
         if (title.isEmpty() && text.isEmpty()) return
 
-        Log.d(TAG, "Posted from $packageName: title='$title' text='${take(text, 80)}'")
+        LogCapture.d(TAG, "Posted from $packageName: title='$title' text='${take(text, 80)}'")
 
         // Cheap sync check: only launch the coroutine if a bot is configured.
         // Avoids waking up ReplyEngine for every WhatsApp notification when the
         // user hasn't set up any bots yet.
         if (!ReplyEngine.hasBotForPackage(packageName)) {
-            Log.d(TAG, "No bot configured for $packageName — skipping")
+            LogCapture.d(TAG, "No bot configured for $packageName — skipping")
             return
         }
 
@@ -141,7 +142,7 @@ class ReplyAINotificationListener : NotificationListenerService() {
             try {
                 ReplyEngine.handleIncoming(packageName, title, text)
             } catch (e: Exception) {
-                Log.e(TAG, "ReplyEngine.handleIncoming failed for $packageName", e)
+                LogCapture.e(TAG, "ReplyEngine.handleIncoming failed for $packageName", e)
             }
         }
     }
@@ -174,7 +175,7 @@ class ReplyAINotificationListener : NotificationListenerService() {
             val allNotifs = activeNotifications ?: return false
             var matchingNotifs = allNotifs.filter { it.packageName == packageName }
             if (matchingNotifs.isEmpty()) {
-                Log.w(TAG, "No active notifications from $packageName")
+                LogCapture.w(TAG, "No active notifications from $packageName")
                 return false
             }
 
@@ -189,12 +190,12 @@ class ReplyAINotificationListener : NotificationListenerService() {
                         body.contains(senderName, ignoreCase = true)
                 }
                 if (senderNotifs.isNotEmpty()) {
-                    Log.i(TAG, "Found ${senderNotifs.size} notification(s) from '$senderName' in $packageName")
+                    LogCapture.i(TAG, "Found ${senderNotifs.size} notification(s) from '$senderName' in $packageName")
                     matchingNotifs = senderNotifs
                 } else {
                     // Fallback: reply to the first available notification rather
                     // than silently dropping the reply. (Better than no reply.)
-                    Log.w(TAG, "No notification from '$senderName' in $packageName — replying to first available")
+                    LogCapture.w(TAG, "No notification from '$senderName' in $packageName — replying to first available")
                 }
             }
 
@@ -209,7 +210,7 @@ class ReplyAINotificationListener : NotificationListenerService() {
                     val remoteInputs = action.remoteInputs ?: continue
                     if (remoteInputs.isEmpty()) continue
 
-                    Log.i(TAG, "Found reply action in $packageName notification")
+                    LogCapture.i(TAG, "Found reply action in $packageName notification")
 
                     val replyIntent = Intent().apply {
                         addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
@@ -228,17 +229,17 @@ class ReplyAINotificationListener : NotificationListenerService() {
                     }
 
                     action.actionIntent?.send(this, 0, replyIntent)
-                    Log.i(TAG, "Replied to $packageName" +
+                    LogCapture.i(TAG, "Replied to $packageName" +
                         (if (senderName != null) " ($senderName)" else "") +
                         ": ${take(replyText, 80)}")
                     return true
                 }
             }
 
-            Log.w(TAG, "No reply action found in $packageName notifications")
+            LogCapture.w(TAG, "No reply action found in $packageName notifications")
             return false
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to reply to notification", e)
+            LogCapture.e(TAG, "Failed to reply to notification", e)
             return false
         }
     }
